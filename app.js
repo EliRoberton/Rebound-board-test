@@ -509,6 +509,52 @@
     setStatus("Firebase: " + err.message, true);
     if ($("coachMessage")) $("coachMessage").textContent = "Firebase: " + err.message;
   }
+
+  // A canvas keeps the target's signal colours separate from page background styling.
+  let signalCanvas = null;
+  let signalLabel = "WAIT";
+  function paintTarget(label = signalLabel) {
+    signalLabel = label;
+    const target = $("target");
+    if (!signalCanvas) {
+      signalCanvas = document.createElement("canvas");
+      signalCanvas.setAttribute("aria-hidden", "true");
+      signalCanvas.style.cssText = "position:absolute;inset:0;width:100%;height:100%;z-index:2;pointer-events:none;forced-color-adjust:none;color-scheme:only light";
+      target.appendChild(signalCanvas);
+      target.style.setProperty("color-scheme", "only light");
+      target.style.setProperty("forced-color-adjust", "none");
+    }
+    if (!targetOpen) return;
+    const width = target.clientWidth || window.innerWidth;
+    const height = target.clientHeight || window.innerHeight;
+    if (!width || !height) return;
+    const scale = Math.min(window.devicePixelRatio || 1, 2);
+    signalCanvas.width = Math.round(width * scale);
+    signalCanvas.height = Math.round(height * scale);
+    const ctx = signalCanvas.getContext("2d");
+    if (!ctx) return; // Existing HTML remains the fallback.
+    ctx.setTransform(scale, 0, 0, scale, 0, 0);
+    const lit = label === "GO";
+    ctx.fillStyle = lit ? "#34e27a" : "#080a0b";
+    ctx.fillRect(0, 0, width, height);
+    ctx.fillStyle = lit ? "#06140b" : label === "HIT" ? "#34e27a" : "#a0a5af";
+    ctx.textAlign = "center";
+    ctx.textBaseline = "middle";
+    const numberSize = Math.min(width * 0.24, height * 0.22, 180);
+    const labelSize = Math.min(width * 0.16, height * 0.14, 110);
+    ctx.font = "900 " + numberSize + "px system-ui, sans-serif";
+    ctx.fillText(activeBoardId, width / 2, height * 0.40);
+    ctx.font = "900 " + labelSize + "px system-ui, sans-serif";
+    ctx.fillText(label, width / 2, height * 0.57, width * 0.9);
+    ctx.font = "600 14px system-ui, sans-serif";
+    ctx.fillText("Tap anywhere to exit", width / 2, height * 0.72);
+    ctx.font = "12px system-ui, sans-serif";
+    ctx.fillText("v0.3.1", width / 2, height - 32);
+    target.setAttribute("aria-label", "Board " + activeBoardId + ": " + label);
+  }
+  window.addEventListener("resize", () => { if (targetOpen) paintTarget(); });
+  document.addEventListener("fullscreenchange", () => { if (targetOpen) paintTarget(); });
+
   function disarm(label = "WAIT") {
     clearTimeout(armTimer);
     armed = null;
@@ -516,6 +562,7 @@
     $("target").style.background = "#080a0b";
     $("target").style.color = label === "HIT" ? "#34e27a" : "#a0a5af";
     $("targetText").textContent = label;
+    paintTarget(label);
   }
   function receiveCommand(command) {
     if (!command || typeof command.id !== "string" || !firebaseReady ||
@@ -536,6 +583,7 @@
     $("target").style.background = "#34e27a";
     $("target").style.color = "#06140b";
     $("targetText").textContent = "GO";
+    paintTarget("GO");
     reportResult(command.id, {state: "lit"}).catch(networkError);
     armTimer = setTimeout(() => {
       if (armed?.id !== command.id) return;
@@ -549,7 +597,7 @@
   });
   if (coachMode) {
     $("app").innerHTML = `
-      <section class="topbar"><div><div class="eyebrow">REBOUND BOARD • v0.3</div>
+      <section class="topbar"><div><div class="eyebrow">REBOUND BOARD • v0.3.1</div>
       <h1>Coach controls</h1></div><div id="connectionBadge" class="badge neutral">CONNECTING</div></section>
       <section class="card">
         <div class="field-row"><label for="coachBoard">Board number</label>
@@ -565,7 +613,7 @@
       <a href="?board=1" style="color:#34e27a">Open board setup</a>
       <div id="status" class="hidden"></div>`;
   } else {
-    $("targetButton").textContent = "Open target — wait for coach";
+    $("targetButton").textContent = "Open target — wait for coach (v0.3.1)";
     $("targetButton").nextElementSibling.textContent = "Enable the sensor, then open the target. It waits dark until the coach lights it. A hit turns the light off.";
     const link = document.createElement("a");
     link.href = "?mode=coach"; link.textContent = "Open coach controls";
@@ -575,4 +623,5 @@
   connectFirebase();
 
 })();
+
 
