@@ -1,0 +1,124 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover,user-scalable=no">
+  <meta name="theme-color" content="#101114">
+  <meta name="mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+  <title>Rebound Board</title>
+  <link rel="manifest" href="./manifest.webmanifest">
+  <link rel="stylesheet" href="./styles.css">
+</head>
+<body>
+  <main id="app">
+    <section class="topbar">
+      <div>
+        <div class="eyebrow">REBOUND BOARD</div>
+        <h1 id="boardTitle">Board Sensor</h1>
+      </div>
+      <div id="connectionBadge" class="badge neutral">LOCAL TEST</div>
+    </section>
+
+    <section class="card setup">
+      <div class="field-row">
+        <label for="boardId">Board ID</label>
+        <input id="boardId" inputmode="numeric" maxlength="2" value="1">
+      </div>
+
+      <div class="button-grid">
+        <button id="enableSensor" class="primary">Enable sensor</button>
+        <button id="wakeButton">Keep screen awake</button>
+      </div>
+
+      <div id="status" class="status">Sensor not started.</div>
+      <div id="httpsWarning" class="warning hidden">
+        Motion sensors may be blocked because this page is not running over HTTPS.
+      </div>
+    </section>
+
+    <section class="metrics">
+      <article class="metric">
+        <span class="label">LIVE</span>
+        <strong id="liveValue">0.00</strong>
+        <span class="unit">m/s²</span>
+      </article>
+      <article class="metric">
+        <span class="label">PEAK</span>
+        <strong id="peakValue">0.00</strong>
+        <span class="unit">m/s²</span>
+      </article>
+      <article class="metric">
+        <span class="label">HITS</span>
+        <strong id="hitCount">0</strong>
+        <span class="unit">detected</span>
+      </article>
+      <article class="metric">
+        <span class="label">SAMPLES</span>
+        <strong id="sampleRate">0</strong>
+        <span class="unit">per sec</span>
+      </article>
+    </section>
+
+    <section class="card">
+      <div class="section-title">
+        <h2>Detection</h2>
+        <button id="resetButton" class="small">Reset</button>
+      </div>
+
+      <label class="slider-label">
+        <span>Hit threshold</span>
+        <b id="thresholdLabel">2.50 m/s²</b>
+      </label>
+      <input id="threshold" type="range" min="0.30" max="20" value="2.50" step="0.10">
+
+      <label class="slider-label">
+        <span>Debounce</span>
+        <b id="debounceLabel">450 ms</b>
+      </label>
+      <input id="debounce" type="range" min="150" max="1500" value="450" step="50">
+
+      <button id="calibrateButton" class="wide">Calibrate from 5 passes</button>
+      <p id="calibrationHelp" class="help">
+        Calibration watches for five strong spikes and suggests a starting threshold. Use normal passes.
+      </p>
+    </section>
+
+    <section class="card">
+      <div class="section-title"><h2>Raw sensor check</h2></div>
+      <div class="raw-grid">
+        <div><span>X</span><b id="xVal">0.00</b></div>
+        <div><span>Y</span><b id="yVal">0.00</b></div>
+        <div><span>Z</span><b id="zVal">0.00</b></div>
+        <div><span>Source</span><b id="sensorSource">—</b></div>
+      </div>
+      <p class="help">
+        If Samples/sec stays at 0 after enabling the sensor, the browser is not supplying motion data.
+      </p>
+    </section>
+
+    <section class="card">
+      <button id="targetButton" class="primary wide">Open full-screen target</button>
+      <p class="help">
+        The target stays green while armed. A detected hit flashes red and records the peak.
+      </p>
+    </section>
+
+    <section class="card">
+      <div class="section-title"><h2>Recent hits</h2></div>
+      <ol id="hitLog" class="hit-log"><li>No hits yet.</li></ol>
+    </section>
+  </main>
+
+  <section id="target" class="target hidden" aria-label="Full screen target">
+    <div class="target-content">
+      <div id="targetBoardNumber" class="target-number">1</div>
+      <div id="targetText" class="target-text">GO</div>
+      <div class="target-sub">Tap anywhere to exit</div>
+    </div>
+  </section>
+
+  <script src="./app.js"></script>
+</body>
+</html>
