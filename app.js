@@ -201,7 +201,10 @@
     lastHitAt = now;
     hits++;
     const trial = armed;
-    if (trial) {
+    if (trial && now >= trial.deadline) {
+      disarm("WAIT");
+      reportResult(trial.id, { state: "timeout" }).catch(networkError);
+    } else if (trial) {
       const reactionMs = Math.max(0, Math.round(now - trial.started));
       disarm("HIT");
       reportResult(trial.id, { state: "hit", reactionMs, magnitude: value }).catch(networkError);
@@ -369,7 +372,10 @@
       let sessionRef = null;
       publishReady = () => {
         if (!firebaseReady || !sessionRef) return;
-        update(sessionRef, {readyToken: targetOpen && sensorEnabled ? readyToken : null}).catch(networkError);
+        update(sessionRef, {
+          readyToken: targetOpen && sensorEnabled ? readyToken : null,
+          debounceMs: Number($("debounce").value)
+        }).catch(networkError);
       };
       reportResult = (id, details) => update(ref(db, "controls/" + activeBoardId + "/results/" + id),
         {...details, time: serverTimestamp()});
@@ -432,86 +438,268 @@
 
   function startCoach(sdk, db) {
     const { ref, onValue, set, serverTimestamp } = sdk;
-    let connected = false, board = "1", ready = null, pending = null;
-    let unwatch = () => {}, unresult = () => {}, timeout;
+    const ROUND_MS = 60000;
+    let connected = false, board = "1", pending = null, drill = null, stopping = false;
+    let drillBoards = ["1", "2"], stopGeneration = 0;
+    let unresult = () => {}, responseTimer, nextTimer, clockTimer;
+    const presence = new Map(), watchers = new Map();
+    const remaining = run => Math.max(0, run.endsAt - performance.now());
+    const tokenFor = id => presence.get(id)?.token || null;
+    const canStart = () => drillBoards.length >= 2 && drillBoards.every(id => tokenFor(id));
+    const message = (kind, text) => {
+      $(kind === "drill" ? "drillMessage" : "coachMessage").textContent = text;
+    };
+
     function buttons() {
-      $("lightBoard").disabled = !connected || !ready || !!pending;
-      $("offBoard").disabled = !connected || !ready;
-      $("coachBoard").disabled = !!pending;
+      const busy = !!pending || !!drill || stopping;
+      $("lightBoard").disabled = !connected || !tokenFor(board) || busy;
+      $("offBoard").disabled = !connected || !tokenFor(board) || !!drill || stopping;
+      $("coachBoard").disabled = busy;
+      $("drillBoards").disabled = busy;
+      $("startDrill").disabled = !connected || !canStart() || busy;
+      $("stopDrill").disabled = !drill;
       $("lightBoard").textContent = "Light up Board " + board;
     }
-    function finish(message) {
-      clearTimeout(timeout); pending = null;
-      $("coachMessage").textContent = message; buttons();
+
+    function renderPresence() {
+      const stateText = id => {
+        const p = presence.get(id);
+        return !p ? "checking…" : p.error ? "connection error" :
+          p.duplicate ? "duplicate ready phones" : p.token ? "ready" :
+          p.online ? "online; open target" : "offline";
+      };
+      const selected = presence.get(board);
+      $("boardPresence").textContent = selected?.duplicate ?
+        "Multiple ready phones share this Board ID. Give each phone a different number." :
+        tokenFor(board) ? "Board " + board + " is ready" : "Board " + board + ": " + stateText(board);
+      $("drillPresence").textContent = drillBoards.length < 2 ?
+        "Enter at least two different board numbers, separated by commas." :
+        drillBoards.map(id => "Board " + id + ": " + stateText(id)).join(" · ");
+      buttons();
     }
-    function watchBoard() {
-      unwatch(); unresult();
-      ready = null; buttons();
-      $("reaction").textContent = "—";
-      unwatch = onValue(ref(db, "boards/" + board + "/connections"), snap => {
-        const sessions = Object.values(snap.val() || {});
-        const usable = sessions.filter(s => typeof s.readyToken === "string");
-        ready = usable.length === 1 ? usable[0].readyToken : null;
-        $("boardPresence").textContent = usable.length > 1 ? "Multiple ready phones share this Board ID. Give each phone a different number." :
-          ready ? "Board " + board + " is ready" : sessions.length ? "Board is online. Enable its sensor and open the target." : "Board is offline";
-        if (pending && ready !== pending.token) {
-          unresult(); finish("Board stopped being ready. Reopen its target and try again.");
-        }
+
+    function renderStats(run) {
+      $("drillTime").textContent = Math.ceil(remaining(run) / 1000) + " s";
+      $("drillHits").textContent = String(run.hits);
+      $("drillAverage").textContent = run.hits ? (run.totalMs / run.hits / 1000).toFixed(3) + " s" : "—";
+    }
+
+    function clearTrial() {
+      const previous = pending;
+      pending = null;
+      clearTimeout(responseTimer);
+      unresult(); unresult = () => {};
+      return previous;
+    }
+
+    function turnOff(trial) {
+      // Block a new start until this off write completes or the old light expires.
+      stopping = true;
+      const generation = ++stopGeneration;
+      buttons();
+      let releaseTimer;
+      const release = () => {
+        if (generation !== stopGeneration) return;
+        clearTimeout(releaseTimer);
+        stopGeneration++;
+        stopping = false;
         buttons();
-      }, err => { ready = null; buttons(); networkError(err); });
+      };
+      releaseTimer = setTimeout(release, Math.max(0, trial.expiresAt - serverNow()) + 1500);
+      set(ref(db, "controls/" + trial.board + "/command"), {
+        id: newCommandId(), action: "off", readyToken: trial.token,
+        targetCommandId: trial.id || null
+      }).then(release).catch(err => {
+        if (generation !== stopGeneration) return;
+        message(trial.kind, "Could not confirm light off. It will expire automatically. " + err.message);
+        // Keep the start buttons blocked until the existing light has expired.
+      });
     }
+
+    function endDrill(reason) {
+      if (!drill) return;
+      const run = drill;
+      drill = null;
+      clearTimeout(nextTimer); clearTimeout(clockTimer);
+      renderStats(run);
+      const trial = clearTrial();
+      message("drill", reason + " " + run.hits + " hit" + (run.hits === 1 ? "." : "s."));
+      if (trial) turnOff(trial);
+      buttons();
+    }
+
+    function failTrial(trial, reason) {
+      if (pending !== trial) return;
+      if (trial.kind === "drill") endDrill(reason);
+      else {
+        clearTrial();
+        message("manual", reason);
+        turnOff(trial);
+      }
+    }
+
+    function syncWatchers() {
+      for (const unsubscribe of watchers.values()) unsubscribe();
+      watchers.clear(); presence.clear(); renderPresence();
+      const needed = new Set([board, ...drillBoards]);
+      for (const id of needed) {
+        const onPresence = (value, error = false) => {
+          const sessions = Object.values(value || {}).filter(s => s && typeof s === "object");
+          const usable = sessions.filter(s => typeof s.readyToken === "string" && s.readyToken.length > 0);
+          const single = usable.length === 1 ? usable[0] : null;
+          presence.set(id, {
+            online: sessions.length > 0, duplicate: usable.length > 1, error,
+            token: !error && single ? single.readyToken : null,
+            debounceMs: single && Number.isFinite(single.debounceMs) ?
+              Math.max(0, Math.min(1500, single.debounceMs)) : 1500
+          });
+          if (drill && drill.tokens[id] && tokenFor(id) !== drill.tokens[id]) {
+            endDrill("Stopped: Board " + id + " is no longer ready.");
+          } else if (pending && pending.board === id && tokenFor(id) !== pending.token) {
+            failTrial(pending, "Board stopped being ready. Reopen its target and try again.");
+          }
+          renderPresence();
+        };
+        watchers.set(id, onValue(ref(db, "boards/" + id + "/connections"),
+          snap => onPresence(snap.val()), () => onPresence(null, true)));
+      }
+    }
+
+    function clockTick(run) {
+      if (drill !== run) return;
+      renderStats(run);
+      if (remaining(run) <= 0) { endDrill("Round complete."); return; }
+      clockTimer = setTimeout(() => clockTick(run), Math.min(250, remaining(run)));
+    }
+
+    function nextTarget(run) {
+      if (drill !== run) return;
+      if (remaining(run) <= 0) { endDrill("Round complete."); return; }
+      const selected = run.boards[Math.floor(Math.random() * run.boards.length)];
+      // A repeated board must finish its sensor debounce before lighting again.
+      const delay = Math.max(500, (run.cooldown[selected] || 0) - performance.now());
+      message("drill", "Next target…");
+      nextTimer = setTimeout(() => {
+        if (drill !== run) return;
+        if (remaining(run) <= 0) { endDrill("Round complete."); return; }
+        sendTrial(selected, "drill");
+      }, delay);
+    }
+
+    function sendTrial(selected, kind) {
+      if (!connected || pending || stopping || !tokenFor(selected)) return;
+      const run = kind === "drill" ? drill : null;
+      if (kind === "drill" && (!run || remaining(run) <= 0)) {
+        endDrill("Round complete."); return;
+      }
+      const duration = run ? Math.min(30000, remaining(run)) : 30000;
+      const trial = {
+        id: newCommandId(), token: tokenFor(selected), board: selected, kind,
+        expiresAt: serverNow() + duration, run
+      };
+      pending = trial;
+      buttons();
+      $("reaction").textContent = "—";
+      message(kind, "Sending light command…");
+      unresult = onValue(ref(db, "controls/" + selected + "/results/" + trial.id), snap => {
+        if (pending !== trial) return;
+        const result = snap.val();
+        if (!result) return;
+        if (run && (drill !== run || remaining(run) <= 0)) {
+          endDrill("Round complete."); return;
+        }
+        if (result.state === "lit") {
+          message(kind, "Board " + selected + " is lit. Waiting for a hit.");
+          return;
+        }
+        if (result.state === "hit") {
+          if (!Number.isFinite(result.reactionMs) || result.reactionMs < 0 || result.reactionMs > 35000) {
+            failTrial(trial, "Stopped: the board returned an invalid reaction time."); return;
+          }
+          clearTrial();
+          $("reaction").textContent = (result.reactionMs / 1000).toFixed(3) + " s";
+          if (run) {
+            run.hits++;
+            run.totalMs += result.reactionMs;
+            run.cooldown[selected] = performance.now() + (presence.get(selected)?.debounceMs ?? 1500) + 100;
+            renderStats(run); nextTarget(run);
+          } else message(kind, "HIT • Board " + selected + " • Light off");
+          buttons();
+        } else if (result.state === "timeout") {
+          clearTrial();
+          if (run) nextTarget(run);
+          else message(kind, "No hit within 30 seconds. Light off.");
+          buttons();
+        } else if (result.state === "cancelled") {
+          failTrial(trial, "Target cancelled. Light off.");
+        }
+      }, err => failTrial(trial, "Could not read the board response. " + err.message));
+      responseTimer = setTimeout(() => failTrial(trial, "No final response. Check the board phone."), duration + 2000);
+      set(ref(db, "controls/" + selected + "/command"), {
+        id: trial.id, action: "light", readyToken: trial.token,
+        issuedAt: serverTimestamp(), expiresAt: trial.expiresAt
+      }).catch(err => failTrial(trial, "Light command failed. " + err.message));
+    }
+
     onValue(ref(db, ".info/connected"), snap => {
       connected = snap.val() === true;
       showConnection(connected ? "COACH ONLINE" : "COACH OFFLINE", connected ? "#16833b" : "#8b2d2d");
-      if (!connected && pending) { unresult(); finish("Connection lost. The board light will expire automatically."); }
+      if (!connected) {
+        if (drill) endDrill("Stopped: coach connection lost.");
+        else if (pending) failTrial(pending, "Connection lost. The board light will expire automatically.");
+      }
       buttons();
     });
+
     $("coachBoard").addEventListener("change", () => {
+      if (pending || drill || stopping) { $("coachBoard").value = board; return; }
       const value = $("coachBoard").value.trim();
       if (!validBoardId(value)) { $("coachBoard").value = board; return; }
-      board = value; watchBoard();
-    });
-    $("lightBoard").addEventListener("click", async () => {
-      if (!connected || !ready || pending) return;
-      const id = newCommandId(), token = ready, selected = board;
-      pending = {id, token}; buttons();
+      board = value;
       $("reaction").textContent = "—";
-      $("coachMessage").textContent = "Sending light command…";
-      unresult();
-      unresult = onValue(ref(db, "controls/" + selected + "/results/" + id), snap => {
-        const result = snap.val();
-        if (!result || pending?.id !== id) return;
-        if (result.state === "lit") $("coachMessage").textContent = "Board " + selected + " is lit. Waiting for a hit.";
-        if (result.state === "hit") {
-          $("reaction").textContent = (Number(result.reactionMs) / 1000).toFixed(3) + " s";
-          finish("HIT • Board " + selected + " • Light off"); unresult();
-        } else if (result.state === "timeout" || result.state === "cancelled") {
-          finish(result.state === "timeout" ? "No hit within 30 seconds. Light off." : "Target cancelled. Light off."); unresult();
-        }
-      }, err => { finish("Could not read the board response."); networkError(err); });
-      timeout = setTimeout(() => {
-        if (pending?.id !== id) return;
-        unresult(); finish("No final response. Check the board phone and try again.");
-      }, 32000);
-      try {
-        await set(ref(db, "controls/" + selected + "/command"), {
-          id, action: "light", readyToken: token,
-          issuedAt: serverTimestamp(), expiresAt: serverNow() + 30000
-        });
-      } catch (err) {
-        if (pending?.id === id) { unresult(); finish("Light command failed."); networkError(err); }
-      }
+      syncWatchers();
     });
-    $("offBoard").addEventListener("click", async () => {
-      if (!connected || !ready) return;
-      try {
-        await set(ref(db, "controls/" + board + "/command"), {
-          id: newCommandId(), action: "off", readyToken: ready
-        });
-        unresult(); finish("Turn-off command sent.");
-      } catch (err) { networkError(err); }
+    $("drillBoards").addEventListener("input", () => {
+      if (pending || drill || stopping) return;
+      const values = $("drillBoards").value.trim().split(/[\s,]+/);
+      drillBoards = values.every(validBoardId) ? [...new Set(values)] : [];
+      syncWatchers();
     });
-    watchBoard();
+    $("lightBoard").addEventListener("click", () => {
+      if (!drill && !stopping) sendTrial(board, "manual");
+    });
+    $("offBoard").addEventListener("click", () => {
+      if (!connected || !tokenFor(board) || drill || stopping) return;
+      const trial = clearTrial() || {
+        id: null, board, token: tokenFor(board), kind: "manual", expiresAt: serverNow() + 30000
+      };
+      message("manual", "Turn-off command sent.");
+      turnOff(trial);
+    });
+    $("startDrill").addEventListener("click", () => {
+      if (!connected || !canStart() || pending || drill || stopping || document.visibilityState === "hidden") return;
+      const run = {
+        boards: drillBoards.slice(),
+        tokens: Object.fromEntries(drillBoards.map(id => [id, tokenFor(id)])),
+        endsAt: performance.now() + ROUND_MS,
+        hits: 0, totalMs: 0, cooldown: {}
+      };
+      drill = run;
+      $("reaction").textContent = "—";
+      message("drill", "Round started.");
+      buttons(); clockTick(run);
+      sendTrial(run.boards[Math.floor(Math.random() * run.boards.length)], "drill");
+    });
+    $("stopDrill").addEventListener("click", () => endDrill("Round stopped."));
+    const leaveCoach = () => {
+      if (drill) endDrill("Stopped: coach screen was left.");
+      else if (pending) failTrial(pending, "Target cancelled: coach screen was left.");
+    };
+    document.addEventListener("visibilitychange", () => {
+      if (document.visibilityState === "hidden") leaveCoach();
+    });
+    window.addEventListener("pagehide", leaveCoach);
+    syncWatchers();
   }
 
   function networkError(err) {
@@ -558,7 +746,7 @@
     ctx.font = "600 14px system-ui, sans-serif";
     ctx.fillText("Tap anywhere to exit", width / 2, height * 0.72);
     ctx.font = "12px system-ui, sans-serif";
-    ctx.fillText("v0.3.2", width / 2, height - 32);
+    ctx.fillText("v0.4.0", width / 2, height - 32);
     target.setAttribute("aria-label", "Board " + activeBoardId + ": " + label);
   }
   window.addEventListener("resize", () => { if (targetOpen) paintTarget(); });
@@ -578,6 +766,7 @@
         !targetOpen || !sensorEnabled || !readyToken ||
         command.readyToken !== readyToken || document.visibilityState === "hidden") return;
     if (command.action === "off") {
+      if (command.targetCommandId && armed && command.targetCommandId !== armed.id) return;
       if (armed) reportResult(armed.id, {state: "cancelled"}).catch(networkError);
       disarm();
       return;
@@ -588,7 +777,8 @@
     lastCommandId = command.id;
     if (armed) reportResult(armed.id, {state: "cancelled"}).catch(networkError);
     disarm();
-    armed = {id: command.id, started: performance.now()};
+    const started = performance.now();
+    armed = {id: command.id, started, deadline: started + Math.max(0, command.expiresAt - serverNow())};
     $("target").style.background = "#34e27a";
     $("target").style.color = "#06140b";
     $("targetText").textContent = "GO";
@@ -606,9 +796,27 @@
   });
   if (coachMode) {
     $("app").innerHTML = `
-      <section class="topbar"><div><div class="eyebrow">REBOUND BOARD • v0.3.2</div>
+      <section class="topbar"><div><div class="eyebrow">REBOUND BOARD • v0.4.0</div>
       <h1>Coach controls</h1></div><div id="connectionBadge" class="badge neutral">CONNECTING</div></section>
+      <section class="card" aria-labelledby="drillTitle">
+        <h2 id="drillTitle">60-second random drill</h2>
+        <label for="drillBoards" style="display:block;margin:14px 0 8px">Board numbers</label>
+        <input id="drillBoards" type="text" value="1, 2" autocomplete="off" spellcheck="false" aria-describedby="drillHelp">
+        <p id="drillPresence" role="status">Checking boards…</p>
+        <div class="button-grid">
+          <button id="startDrill" class="primary" disabled>Start drill</button>
+          <button id="stopDrill" disabled>Stop</button>
+        </div>
+        <div class="metrics" style="grid-template-columns:repeat(3,minmax(0,1fr))">
+          <div class="metric"><span class="label">TIME LEFT</span><strong id="drillTime" style="font-size:24px">60 s</strong></div>
+          <div class="metric"><span class="label">HITS</span><strong id="drillHits" style="font-size:24px">0</strong></div>
+          <div class="metric"><span class="label">AVERAGE</span><strong id="drillAverage" style="font-size:24px">—</strong></div>
+        </div>
+        <p id="drillMessage" class="status" role="status">Open the target on each board phone, then press Start drill.</p>
+        <p id="drillHelp" class="help">Use two or more board numbers, separated by commas. Targets are random and may repeat, with a short reset pause after each hit. Keep this coach screen open; leaving it stops the drill.</p>
+      </section>
       <section class="card">
+        <h2 style="margin-bottom:14px">Manual controls</h2>
         <div class="field-row"><label for="coachBoard">Board number</label>
         <input id="coachBoard" type="number" min="1" max="99" value="1"></div>
         <p id="boardPresence" role="status">Checking board…</p>
@@ -622,7 +830,7 @@
       <a href="?board=1" style="color:#34e27a">Open board setup</a>
       <div id="status" class="hidden"></div>`;
   } else {
-    $("targetButton").textContent = "Open target — wait for coach (v0.3.2)";
+    $("targetButton").textContent = "Open target — wait for coach (v0.4.0)";
     $("targetButton").nextElementSibling.textContent = "Enable the sensor, then open the target. It waits dark until the coach lights it. A hit turns the light off.";
     const link = document.createElement("a");
     link.href = "?mode=coach"; link.textContent = "Open coach controls";
