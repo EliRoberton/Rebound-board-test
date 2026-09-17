@@ -2,6 +2,15 @@
   "use strict";
 
   const $ = (id) => document.getElementById(id);
+  // Older Android browsers support getRandomValues but not randomUUID.
+  function newCommandId() {
+    const bytes = new Uint8Array(16);
+    crypto.getRandomValues(bytes);
+    bytes[6] = (bytes[6] & 15) | 64;
+    bytes[8] = (bytes[8] & 63) | 128;
+    return Array.from(bytes, b => b.toString(16).padStart(2, "0")).join("");
+  }
+
   const STORAGE_KEY = "rebound-board-v01";
   const settings = loadSettings();
   const coachMode = new URLSearchParams(location.search).get("mode") === "coach";
@@ -305,7 +314,7 @@
     targetOpen = true;
     refreshBoardNumber();
     $("target").classList.remove("hidden","hit");
-    readyToken = crypto.randomUUID();
+    readyToken = newCommandId();
     disarm("WAIT");
     publishReady();
     document.documentElement.requestFullscreen?.().catch(()=>{});
@@ -388,7 +397,7 @@
           sessionRef = null;
           disarm("OFFLINE");
           // Require a fresh command after reconnect, never replay the last light.
-          if (targetOpen) readyToken = crypto.randomUUID();
+          if (targetOpen) readyToken = newCommandId();
           showConnection("OFFLINE • BOARD " + activeBoardId, "#8b2d2d");
           return;
         }
@@ -464,7 +473,7 @@
     });
     $("lightBoard").addEventListener("click", async () => {
       if (!connected || !ready || pending) return;
-      const id = crypto.randomUUID(), token = ready, selected = board;
+      const id = newCommandId(), token = ready, selected = board;
       pending = {id, token}; buttons();
       $("reaction").textContent = "—";
       $("coachMessage").textContent = "Sending light command…";
@@ -497,7 +506,7 @@
       if (!connected || !ready) return;
       try {
         await set(ref(db, "controls/" + board + "/command"), {
-          id: crypto.randomUUID(), action: "off", readyToken: ready
+          id: newCommandId(), action: "off", readyToken: ready
         });
         unresult(); finish("Turn-off command sent.");
       } catch (err) { networkError(err); }
@@ -549,7 +558,7 @@
     ctx.font = "600 14px system-ui, sans-serif";
     ctx.fillText("Tap anywhere to exit", width / 2, height * 0.72);
     ctx.font = "12px system-ui, sans-serif";
-    ctx.fillText("v0.3.1", width / 2, height - 32);
+    ctx.fillText("v0.3.2", width / 2, height - 32);
     target.setAttribute("aria-label", "Board " + activeBoardId + ": " + label);
   }
   window.addEventListener("resize", () => { if (targetOpen) paintTarget(); });
@@ -597,7 +606,7 @@
   });
   if (coachMode) {
     $("app").innerHTML = `
-      <section class="topbar"><div><div class="eyebrow">REBOUND BOARD • v0.3.1</div>
+      <section class="topbar"><div><div class="eyebrow">REBOUND BOARD • v0.3.2</div>
       <h1>Coach controls</h1></div><div id="connectionBadge" class="badge neutral">CONNECTING</div></section>
       <section class="card">
         <div class="field-row"><label for="coachBoard">Board number</label>
@@ -613,7 +622,7 @@
       <a href="?board=1" style="color:#34e27a">Open board setup</a>
       <div id="status" class="hidden"></div>`;
   } else {
-    $("targetButton").textContent = "Open target — wait for coach (v0.3.1)";
+    $("targetButton").textContent = "Open target — wait for coach (v0.3.2)";
     $("targetButton").nextElementSibling.textContent = "Enable the sensor, then open the target. It waits dark until the coach lights it. A hit turns the light off.";
     const link = document.createElement("a");
     link.href = "?mode=coach"; link.textContent = "Open coach controls";
@@ -623,5 +632,3 @@
   connectFirebase();
 
 })();
-
-
