@@ -4,6 +4,12 @@
   const $ = (id) => document.getElementById(id);
   const STORAGE_KEY = "rebound-board-v01";
   const settings = loadSettings();
+  const coachMode = new URLSearchParams(location.search).get("mode") === "coach";
+  let armed = null, armTimer = null, readyToken = null;
+  let publishReady = () => {};
+  let reportResult = () => Promise.resolve();
+  let serverOffset = 0;
+  const serverNow = () => Date.now() + serverOffset;
 
   function validBoardId(value) {
     return /^[1-9][0-9]?$/.test(String(value));
@@ -93,6 +99,7 @@
   $("target").addEventListener("click", closeTarget);
 
   document.addEventListener("visibilitychange", async () => {
+    if (coachMode) return;
     if (document.visibilityState === "visible" && wakeLock === null && $("wakeButton").dataset.enabled === "1") {
       await requestWakeLock();
     }
@@ -184,6 +191,12 @@
   function registerHit(value, now){
     lastHitAt = now;
     hits++;
+    const trial = armed;
+    if (trial) {
+      const reactionMs = Math.max(0, Math.round(now - trial.started));
+      disarm("HIT");
+      reportResult(trial.id, { state: "hit", reactionMs, magnitude: value }).catch(networkError);
+    }
     if (firebaseReady && sendHit) {
       sendHit(value).catch(err => {
         setStatus("Hit counted locally; upload failed: " + err.message, true);
@@ -198,7 +211,7 @@
     recentHits = recentHits.slice(0, 8);
     renderHitLog();
 
-    if (targetOpen){
+    if (targetOpen && !readyToken){
       $("target").classList.add("hit");
       $("targetText").textContent = "HIT";
       if (navigator.vibrate) navigator.vibrate(55);
@@ -231,6 +244,7 @@
   }
 
   function startCalibration(){
+    if (targetOpen) closeTarget();
     if (!sensorEnabled){
       setStatus("Enable the sensor before calibrating.", true);
       return;
@@ -284,15 +298,25 @@
       setStatus("Enable the sensor first.", true);
       return;
     }
+    if (calibrating) {
+      setStatus("Finish calibration before opening the target.", true);
+      return;
+    }
     targetOpen = true;
     refreshBoardNumber();
     $("target").classList.remove("hidden","hit");
-    $("targetText").textContent = "GO";
+    readyToken = crypto.randomUUID();
+    disarm("WAIT");
+    publishReady();
     document.documentElement.requestFullscreen?.().catch(()=>{});
   }
 
   function closeTarget(){
+    if (armed) reportResult(armed.id, { state: "cancelled" }).catch(networkError);
+    disarm("WAIT");
+    readyToken = null;
     targetOpen = false;
+    publishReady();
     $("target").classList.add("hidden");
     $("target").classList.remove("hit");
     document.exitFullscreen?.().catch(()=>{});
@@ -328,6 +352,19 @@
         appId: "1:1088085580500:web:4146980a5a3c5a30593941"
       });
       const db = getDatabase(app);
+      onValue(ref(db, ".info/serverTimeOffset"), snap => { serverOffset = Number(snap.val()) || 0; });
+      if (coachMode) {
+        startCoach(sdk, db);
+        return;
+      }
+      let sessionRef = null;
+      publishReady = () => {
+        if (!firebaseReady || !sessionRef) return;
+        update(sessionRef, {readyToken: targetOpen && sensorEnabled ? readyToken : null}).catch(networkError);
+      };
+      reportResult = (id, details) => update(ref(db, "controls/" + activeBoardId + "/results/" + id),
+        {...details, time: serverTimestamp()});
+      onValue(ref(db, "controls/" + activeBoardId + "/command"), snap => receiveCommand(snap.val()), networkError);
       const boardPath = "boards/" + activeBoardId;
       let generation = 0;
 
@@ -348,21 +385,27 @@
         const thisGeneration = ++generation;
         firebaseReady = false;
         if (snapshot.val() !== true) {
+          sessionRef = null;
+          disarm("OFFLINE");
+          // Require a fresh command after reconnect, never replay the last light.
+          if (targetOpen) readyToken = crypto.randomUUID();
           showConnection("OFFLINE • BOARD " + activeBoardId, "#8b2d2d");
           return;
         }
         showConnection("REGISTERING • BOARD " + activeBoardId, "#555");
         // Each connection has its own record: one tab cannot mark another offline.
         const session = push(ref(db, boardPath + "/connections"));
+        sessionRef = session;
         (async () => {
           await onDisconnect(session).remove();
           if (thisGeneration !== generation) return;
-          await set(session, { connectedAt: serverTimestamp() });
+          await set(session, { connectedAt: serverTimestamp(), readyToken: targetOpen ? readyToken : null });
           await update(ref(db, boardPath), {
             boardId: activeBoardId, lastSeen: serverTimestamp()
           });
           if (thisGeneration !== generation) return;
           firebaseReady = true;
+          publishReady();
           showConnection("ONLINE • BOARD " + activeBoardId, "#16833b");
         })().catch(err => {
           if (thisGeneration !== generation) return;
@@ -375,6 +418,159 @@
       showConnection("LOCAL ONLY", "#8b2d2d");
       setStatus("Firebase could not load: " + err.message + " Refresh to retry. Local testing still works.", true);
     }
+  }
+
+
+  function startCoach(sdk, db) {
+    const { ref, onValue, set, serverTimestamp } = sdk;
+    let connected = false, board = "1", ready = null, pending = null;
+    let unwatch = () => {}, unresult = () => {}, timeout;
+    function buttons() {
+      $("lightBoard").disabled = !connected || !ready || !!pending;
+      $("offBoard").disabled = !connected || !ready;
+      $("coachBoard").disabled = !!pending;
+      $("lightBoard").textContent = "Light up Board " + board;
+    }
+    function finish(message) {
+      clearTimeout(timeout); pending = null;
+      $("coachMessage").textContent = message; buttons();
+    }
+    function watchBoard() {
+      unwatch(); unresult();
+      ready = null; buttons();
+      $("reaction").textContent = "—";
+      unwatch = onValue(ref(db, "boards/" + board + "/connections"), snap => {
+        const sessions = Object.values(snap.val() || {});
+        const usable = sessions.filter(s => typeof s.readyToken === "string");
+        ready = usable.length === 1 ? usable[0].readyToken : null;
+        $("boardPresence").textContent = usable.length > 1 ? "Multiple ready phones share this Board ID. Give each phone a different number." :
+          ready ? "Board " + board + " is ready" : sessions.length ? "Board is online. Enable its sensor and open the target." : "Board is offline";
+        if (pending && ready !== pending.token) {
+          unresult(); finish("Board stopped being ready. Reopen its target and try again.");
+        }
+        buttons();
+      }, err => { ready = null; buttons(); networkError(err); });
+    }
+    onValue(ref(db, ".info/connected"), snap => {
+      connected = snap.val() === true;
+      showConnection(connected ? "COACH ONLINE" : "COACH OFFLINE", connected ? "#16833b" : "#8b2d2d");
+      if (!connected && pending) { unresult(); finish("Connection lost. The board light will expire automatically."); }
+      buttons();
+    });
+    $("coachBoard").addEventListener("change", () => {
+      const value = $("coachBoard").value.trim();
+      if (!validBoardId(value)) { $("coachBoard").value = board; return; }
+      board = value; watchBoard();
+    });
+    $("lightBoard").addEventListener("click", async () => {
+      if (!connected || !ready || pending) return;
+      const id = crypto.randomUUID(), token = ready, selected = board;
+      pending = {id, token}; buttons();
+      $("reaction").textContent = "—";
+      $("coachMessage").textContent = "Sending light command…";
+      unresult();
+      unresult = onValue(ref(db, "controls/" + selected + "/results/" + id), snap => {
+        const result = snap.val();
+        if (!result || pending?.id !== id) return;
+        if (result.state === "lit") $("coachMessage").textContent = "Board " + selected + " is lit. Waiting for a hit.";
+        if (result.state === "hit") {
+          $("reaction").textContent = (Number(result.reactionMs) / 1000).toFixed(3) + " s";
+          finish("HIT • Board " + selected + " • Light off"); unresult();
+        } else if (result.state === "timeout" || result.state === "cancelled") {
+          finish(result.state === "timeout" ? "No hit within 30 seconds. Light off." : "Target cancelled. Light off."); unresult();
+        }
+      }, err => { finish("Could not read the board response."); networkError(err); });
+      timeout = setTimeout(() => {
+        if (pending?.id !== id) return;
+        unresult(); finish("No final response. Check the board phone and try again.");
+      }, 32000);
+      try {
+        await set(ref(db, "controls/" + selected + "/command"), {
+          id, action: "light", readyToken: token,
+          issuedAt: serverTimestamp(), expiresAt: serverNow() + 30000
+        });
+      } catch (err) {
+        if (pending?.id === id) { unresult(); finish("Light command failed."); networkError(err); }
+      }
+    });
+    $("offBoard").addEventListener("click", async () => {
+      if (!connected || !ready) return;
+      try {
+        await set(ref(db, "controls/" + board + "/command"), {
+          id: crypto.randomUUID(), action: "off", readyToken: ready
+        });
+        unresult(); finish("Turn-off command sent.");
+      } catch (err) { networkError(err); }
+    });
+    watchBoard();
+  }
+
+  function networkError(err) {
+    setStatus("Firebase: " + err.message, true);
+    if ($("coachMessage")) $("coachMessage").textContent = "Firebase: " + err.message;
+  }
+  function disarm(label = "WAIT") {
+    clearTimeout(armTimer);
+    armed = null;
+    $("target").classList.remove("hit");
+    $("target").style.background = "#080a0b";
+    $("target").style.color = label === "HIT" ? "#34e27a" : "#a0a5af";
+    $("targetText").textContent = label;
+  }
+  function receiveCommand(command) {
+    if (!command || typeof command.id !== "string" || !firebaseReady ||
+        !targetOpen || !sensorEnabled || !readyToken ||
+        command.readyToken !== readyToken || document.visibilityState === "hidden") return;
+    if (command.action === "off") {
+      if (armed) reportResult(armed.id, {state: "cancelled"}).catch(networkError);
+      disarm();
+      return;
+    }
+    if (command.action !== "light" || typeof command.expiresAt !== "number" ||
+        command.expiresAt <= serverNow() || command.expiresAt > serverNow() + 35000 ||
+        command.id === lastCommandId) return;
+    lastCommandId = command.id;
+    if (armed) reportResult(armed.id, {state: "cancelled"}).catch(networkError);
+    disarm();
+    armed = {id: command.id, started: performance.now()};
+    $("target").style.background = "#34e27a";
+    $("target").style.color = "#06140b";
+    $("targetText").textContent = "GO";
+    reportResult(command.id, {state: "lit"}).catch(networkError);
+    armTimer = setTimeout(() => {
+      if (armed?.id !== command.id) return;
+      disarm();
+      reportResult(command.id, {state: "timeout"}).catch(networkError);
+    }, Math.max(0, command.expiresAt - serverNow()));
+  }
+  let lastCommandId = null;
+  document.addEventListener("visibilitychange", () => {
+    if (document.visibilityState === "hidden" && targetOpen) closeTarget();
+  });
+  if (coachMode) {
+    $("app").innerHTML = `
+      <section class="topbar"><div><div class="eyebrow">REBOUND BOARD • v0.3</div>
+      <h1>Coach controls</h1></div><div id="connectionBadge" class="badge neutral">CONNECTING</div></section>
+      <section class="card">
+        <div class="field-row"><label for="coachBoard">Board number</label>
+        <input id="coachBoard" type="number" min="1" max="99" value="1"></div>
+        <p id="boardPresence" role="status">Checking board…</p>
+        <div class="button-grid"><button id="lightBoard" class="primary" disabled>Light up Board 1</button>
+        <button id="offBoard" disabled>Turn off</button></div>
+        <p id="coachMessage" class="status" role="status">Connect the Android, enable its sensor and open its target screen.</p>
+      </section>
+      <section class="card"><h2>Last reaction</h2><p id="reaction" style="font-size:36px;margin:12px 0">—</p>
+        <p class="help">Measured on the board phone from the green screen update to the detected hit. Lights expire after 30 seconds.</p>
+      </section>
+      <a href="?board=1" style="color:#34e27a">Open board setup</a>
+      <div id="status" class="hidden"></div>`;
+  } else {
+    $("targetButton").textContent = "Open target — wait for coach";
+    $("targetButton").nextElementSibling.textContent = "Enable the sensor, then open the target. It waits dark until the coach lights it. A hit turns the light off.";
+    const link = document.createElement("a");
+    link.href = "?mode=coach"; link.textContent = "Open coach controls";
+    link.style.cssText = "display:block;color:#34e27a;margin:16px 0";
+    $("app").prepend(link);
   }
   connectFirebase();
 
