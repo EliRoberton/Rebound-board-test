@@ -1,4 +1,3 @@
-
 (() => {
   "use strict";
 
@@ -6,6 +5,15 @@
   const STORAGE_KEY = "rebound-board-v01";
   const settings = loadSettings();
 
+  function validBoardId(value) {
+    return /^[1-9][0-9]?$/.test(String(value));
+  }
+  const requestedBoard = new URLSearchParams(window.location.search).get("board");
+  const activeBoardId = validBoardId(requestedBoard) ? requestedBoard :
+    (validBoardId(settings.boardId) ? String(settings.boardId) : "1");
+  settings.boardId = activeBoardId;
+  let firebaseReady = false;
+  let sendHit = null;
   let sensorEnabled = false;
   let wakeLock = null;
   let peak = 0;
@@ -45,7 +53,7 @@
       threshold: Number($("threshold").value),
       debounce: Number($("debounce").value)
     };
-    localStorage.setItem(STORAGE_KEY, JSON.stringify(data));
+    try { localStorage.setItem(STORAGE_KEY, JSON.stringify(data)); } catch {}
   }
 
   function refreshLabels(){
@@ -59,10 +67,21 @@
     $("boardTitle").textContent = "Board " + id + " Sensor";
   }
 
-  $("boardId").addEventListener("input", () => {
-    refreshBoardNumber();
+  $("boardId").addEventListener("change", () => {
+    const next = $("boardId").value.trim();
+    if (!validBoardId(next)) {
+      $("boardId").value = activeBoardId;
+      setStatus("Use a Board ID from 1 to 99.", true);
+      return;
+    }
     saveSettings();
+    if (next !== activeBoardId) {
+      const url = new URL(window.location.href);
+      url.searchParams.set("board", next);
+      window.location.assign(url.href);
+    }
   });
+  saveSettings();
   $("threshold").addEventListener("input", () => { refreshLabels(); saveSettings(); });
   $("debounce").addEventListener("input", () => { refreshLabels(); saveSettings(); });
 
@@ -165,6 +184,11 @@
   function registerHit(value, now){
     lastHitAt = now;
     hits++;
+    if (firebaseReady && sendHit) {
+      sendHit(value).catch(err => {
+        setStatus("Hit counted locally; upload failed: " + err.message, true);
+      });
+    }
     $("hitCount").textContent = String(hits);
 
     recentHits.unshift({
@@ -278,4 +302,81 @@
     $("status").textContent = text;
     $("status").style.color = error ? "#ffd08a" : "#d9dce1";
   }
+
+  // Firebase loads separately so local motion testing still works if it fails.
+  function showConnection(text, colour) {
+    $("connectionBadge").textContent = text;
+    $("connectionBadge").style.background = colour;
+    $("connectionBadge").style.color = "white";
+  }
+
+  async function connectFirebase() {
+    showConnection("CONNECTING • BOARD " + activeBoardId, "#555");
+    try {
+      const [{ initializeApp }, sdk] = await Promise.all([
+        import("https://www.gstatic.com/firebasejs/12.19.0/firebase-app.js"),
+        import("https://www.gstatic.com/firebasejs/12.19.0/firebase-database.js")
+      ]);
+      const { getDatabase, ref, push, set, update, onValue, onDisconnect, serverTimestamp } = sdk;
+      const app = initializeApp({
+        apiKey: "AIzaSyBwa_ZiaVEo8sSz4NGIe93DCDREmq7387k",
+        authDomain: "rebound-boards.firebaseapp.com",
+        databaseURL: "https://rebound-boards-default-rtdb.firebaseio.com",
+        projectId: "rebound-boards",
+        storageBucket: "rebound-boards.firebasestorage.app",
+        messagingSenderId: "1088085580500",
+        appId: "1:1088085580500:web:4146980a5a3c5a30593941"
+      });
+      const db = getDatabase(app);
+      const boardPath = "boards/" + activeBoardId;
+      let generation = 0;
+
+      sendHit = async magnitude => {
+        const hitRef = push(ref(db, boardPath + "/hits"));
+        await update(ref(db, boardPath), {
+          ["hits/" + hitRef.key]: {
+            time: serverTimestamp(),
+            clientTime: Date.now(),
+            magnitude: Number(magnitude.toFixed(3)),
+            sensorSource: $("sensorSource").textContent
+          },
+          lastHit: serverTimestamp()
+        });
+      };
+
+      onValue(ref(db, ".info/connected"), snapshot => {
+        const thisGeneration = ++generation;
+        firebaseReady = false;
+        if (snapshot.val() !== true) {
+          showConnection("OFFLINE • BOARD " + activeBoardId, "#8b2d2d");
+          return;
+        }
+        showConnection("REGISTERING • BOARD " + activeBoardId, "#555");
+        // Each connection has its own record: one tab cannot mark another offline.
+        const session = push(ref(db, boardPath + "/connections"));
+        (async () => {
+          await onDisconnect(session).remove();
+          if (thisGeneration !== generation) return;
+          await set(session, { connectedAt: serverTimestamp() });
+          await update(ref(db, boardPath), {
+            boardId: activeBoardId, lastSeen: serverTimestamp()
+          });
+          if (thisGeneration !== generation) return;
+          firebaseReady = true;
+          showConnection("ONLINE • BOARD " + activeBoardId, "#16833b");
+        })().catch(err => {
+          if (thisGeneration !== generation) return;
+          firebaseReady = false;
+          showConnection("FIREBASE ERROR", "#8b2d2d");
+          setStatus("Firebase: " + err.message + " Local sensor testing still works.", true);
+        });
+      });
+    } catch (err) {
+      showConnection("LOCAL ONLY", "#8b2d2d");
+      setStatus("Firebase could not load: " + err.message + " Refresh to retry. Local testing still works.", true);
+    }
+  }
+  connectFirebase();
+
 })();
+
